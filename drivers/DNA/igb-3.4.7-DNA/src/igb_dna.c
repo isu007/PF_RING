@@ -278,44 +278,33 @@ void dna_cleanup_tx_ring(struct ixgbe_ring *tx_ring) {
 /* ********************************** */
 
 void notify_function_ptr(void *rx_data, void *tx_data, u_int8_t device_in_use) {
-  struct igb_ring	*rx_ring = (struct igb_ring*)rx_data;
-  struct igb_adapter	*adapter = netdev_priv(rx_ring->netdev);
+  struct igb_ring	*rx_ring = (struct igb_ring *) rx_data;
+  struct igb_ring	*tx_ring = (struct igb_ring *) tx_data;
+  struct igb_ring	*xx_ring = (rx_ring != NULL) ? rx_ring : tx_ring;
+  struct igb_adapter	*adapter = netdev_priv(xx_ring->netdev);
 
-  if(unlikely(enable_debug))
-    printk("%s(): device_in_use = %d\n",__FUNCTION__, device_in_use);
+  if(likely(device_in_use)) { /* We start using this device */
 
-  /* I need interrupts for purging buckets when queues are not in use */
-  igb_irq_enable_queues(adapter, rx_ring->queue_index);
-
-  if(likely(device_in_use)) {
-    /* We start using this device */
     try_module_get(THIS_MODULE); /* ++ */
-    rx_ring->dna.queue_in_use = 1;
 
-    if(unlikely(enable_debug))
-      printk("[DNA] %s(): %s@%d is IN use\n", __FUNCTION__,
-	     rx_ring->netdev->name, rx_ring->queue_index);
+    if (rx_ring != NULL)
+      igb_irq_disable_queues(adapter, ((u64)1 << rx_ring->queue_index));
 
-    igb_irq_disable_queues(adapter, ((u64)1 << rx_ring->queue_index));
-  } else {
-    /* We're done using this device */
+  } else { /* We're done using this device */
     
-    /* resetting the ring */
-    /* we *must* reset the right direction only (doing this in userspace)
-    dna_cleanup_rx_ring(rx_ring);
-    dna_cleanup_tx_ring(tx_ring);
-    */
+    if (rx_ring != NULL)
+      /* I need interrupts for purging buckets when queues are not in use */
+      igb_irq_enable_queues(adapter, rx_ring->queue_index);
 
     module_put(THIS_MODULE);  /* -- */
-
-    rx_ring->dna.queue_in_use = 0;
-
-    igb_irq_enable_queues(adapter, rx_ring->queue_index);
-    
-    if(unlikely(enable_debug))
-      printk("[DNA] %s(): %s@%d is NOT IN use\n", __FUNCTION__,
-	     rx_ring->netdev->name, rx_ring->queue_index);
   }
+
+  if (rx_ring != NULL) rx_ring->dna.queue_in_use = device_in_use;
+  if (tx_ring != NULL) tx_ring->dna.queue_in_use = device_in_use;
+
+  if(unlikely(enable_debug))
+    printk("[DNA] %s(): %s@%d is %sIN use\n", __FUNCTION__,
+	   xx_ring->netdev->name, xx_ring->queue_index, device_in_use ? "" : "NOT ");
 }
 
 /* ********************************** */
@@ -334,15 +323,14 @@ int wait_packet_function_ptr(void *data, int mode)
   if(!rx_ring->dna.memory_allocated) return(0);
 
   if(mode == 1 /* Enable interrupt */) {
-    union e1000_adv_rx_desc *rx_desc;
+    union e1000_adv_rx_desc *rx_desc, *next_rx_desc;
     u32	staterr;
     u8	reg_idx = rx_ring->reg_idx;
     u16	i = E1000_READ_REG(hw, E1000_RDT(reg_idx));
 
     /* Very important: update the value from the register set from userland
      * Here i is the last I've read (zero-copy implementation) */
-    if(++i == rx_ring->count)
-      i = 0;
+    if(++i == rx_ring->count) i = 0;
     /* Here i is the next I have to read */
 
     rx_ring->next_to_clean = i;
@@ -350,6 +338,14 @@ int wait_packet_function_ptr(void *data, int mode)
     rx_desc = IGB_RX_DESC(rx_ring, i);
     prefetch(rx_desc);
     staterr = le32_to_cpu(rx_desc->wb.upper.status_error);
+
+    /* trick for appplications calling poll/select directly (indexes not in sync of one position at most) */
+    if (!(staterr & E1000_RXD_STAT_DD)) {
+      u16 next_i = i;
+      if(++next_i == rx_ring->count) next_i = 0;
+      next_rx_desc = IGB_RX_DESC(rx_ring, next_i);
+      staterr = le32_to_cpu(next_rx_desc->wb.upper.status_error);
+    }
 
     if(unlikely(enable_debug)) {
       printk("%s(): Check if a packet is arrived [idx=%d][staterr=%d][len=%d]\n",
@@ -377,6 +373,7 @@ int wait_packet_function_ptr(void *data, int mode)
 
       /* Refresh the value */
       staterr = le32_to_cpu(rx_desc->wb.upper.status_error);
+      if (!(staterr & E1000_RXD_STAT_DD)) staterr = le32_to_cpu(next_rx_desc->wb.upper.status_error);
     } else {
       rx_ring->dna.rx_tx.rx.interrupt_received = 1; 
     }

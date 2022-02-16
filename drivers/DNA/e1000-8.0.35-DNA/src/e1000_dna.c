@@ -157,7 +157,7 @@ int wait_packet_function_ptr(void *data, int mode) {
 
   if(mode == 1) {
     struct e1000_rx_ring *rx_ring = adapter->rx_ring;
-    struct e1000_rx_desc *rx_desc;
+    struct e1000_rx_desc *rx_desc, *next_rx_desc;
     int ret;
 
     u16 i = E1000_READ_REG(&adapter->hw, E1000_RDT(0));
@@ -171,6 +171,14 @@ int wait_packet_function_ptr(void *data, int mode) {
 
     rx_desc = E1000_RX_DESC(*rx_ring, rx_ring->next_to_clean);
     ret = rx_desc->status & E1000_RXD_STAT_DD;
+
+    /* trick for appplications calling poll/select directly (indexes not in sync of one position at most) */
+    if (!ret) {
+      u16 next_i = i;
+      if(++next_i == rx_ring->count) next_i = 0;
+      next_rx_desc = E1000_RX_DESC(*rx_ring, next_i);
+      ret = next_rx_desc->status & E1000_RXD_STAT_DD;
+    }
 
     if(unlikely(enable_debug))
       printk("[wait_packet_function_ptr] Check if a packet is arrived [slotId=%u][status=%u][ret=%u]\n",
@@ -264,7 +272,7 @@ void alloc_dna_memory(struct e1000_adapter *adapter) {
   struct e1000_tx_ring *tx_ring = adapter->tx_ring;
   struct e1000_tx_desc *tx_desc, *shadow_tx_desc;
   struct pfring_hooks *hook = (struct pfring_hooks*)netdev->pfring_ptr;
-  union e1000_rx_desc_extended *rx_desc, *shadow_rx_desc;
+  struct e1000_rx_desc *rx_desc, *shadow_rx_desc;
   struct e1000_rx_buffer *buffer_rx_info;
   struct e1000_buffer    *buffer_tx_info;
   u16 cache_line_size;
@@ -352,21 +360,13 @@ void alloc_dna_memory(struct e1000_adapter *adapter) {
 		 i, buffer_rx_info->dma, adapter->dna.packet_slot_len);
 #endif
 
-	rx_desc = E1000_RX_DESC_EXT(*rx_ring, i);
-	rx_desc->read.buffer_addr = cpu_to_le64(buffer_rx_info->dma);
-	rx_desc->read.reserved = 0; /*
-				      This field is used to store indexes so we better
-				      set it to zero
-				    */
+	rx_desc = E1000_RX_DESC(*rx_ring, i);
+	rx_desc->buffer_addr = cpu_to_le64(buffer_rx_info->dma);
+	rx_desc->status = 0;
+	rx_desc->errors = 0;
 
-#ifdef DEBUG
-	if(0)
-	  printk("[DNA] RX descriptor %d [len=%d][status=%u]\n",
-		 i, rx_desc->wb.upper.length, rx_desc->wb.upper.status_error);
-#endif
-
-	shadow_rx_desc = E1000_RX_DESC_EXT(*rx_ring, i + rx_ring->count);
-	memcpy(shadow_rx_desc, rx_desc, sizeof(union e1000_rx_desc_extended));
+	shadow_rx_desc = E1000_RX_DESC(*rx_ring, i + rx_ring->count);
+	memcpy(shadow_rx_desc, rx_desc, sizeof(struct e1000_rx_desc));
       }
 
       wmb();

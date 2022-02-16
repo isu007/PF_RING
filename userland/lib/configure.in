@@ -114,6 +114,14 @@ if test "x$enable_rdi" != "xno"; then :
   fi
 fi
 
+AC_CHECK_LIB([hiredis], [redisCommand])
+if test "x$ac_cv_lib_hiredis_redisCommand" = xyes; then :
+REDIS_LIB="-lhiredis"
+AC_DEFINE_UNQUOTED(HAVE_REDIS, 1, [redis is present])
+else
+REDIS_LIB=""
+fi
+
 AC_CHECK_LIB( [nl], [nl_handle_alloc], [SYSLIBS="$SYSLIBS -lnl"])
 
 AC_CHECK_LIB( [dag], 
@@ -163,16 +171,13 @@ AC_SUBST(HAVE_DAG)
 AC_SUBST(DAG_OBJS)
 AC_SUBST(HAVE_BPF)
 AC_SUBST(BPF_INCLUDE)
-AC_SUBST(BPF_LIB)
+dnl AC_SUBST(BPF_LIB)
+AC_SUBST(REDIS_LIB)
 AC_SUBST(SYSLIBS)
 AC_SUBST(INSTALL_PREFIX)
 AC_SUBST(SILICOM_LIBS)
 AC_SUBST(HAVE_REDIRECTOR)
 AC_SUBST(HAVE_HW_TIMESTAMP)
-AC_SUBST(HAVE_QAT)
-AC_SUBST(QAT_LIB)
-AC_SUBST(QAT_OBJS)
-AC_SUBST(QAT_DEP)
 
 dnl> AC_CONFIG_FILES([Makefile])
 AC_CONFIG_FILES([../examples/Makefile])

@@ -1325,6 +1325,11 @@ pcap_activate_linux(pcap_t *handle)
 	 * "handle->fd" is a socket, so "select()" and "poll()"
 	 * should work on it.
 	 */
+#ifdef HAVE_PF_RING
+	if(handle->ring != NULL) {
+		handle->selectable_fd = pfring_get_selectable_fd(handle->ring);
+	} else
+#endif
 	handle->selectable_fd = handle->fd;
 
 	return status;
@@ -1421,9 +1426,12 @@ pcap_read_packet(pcap_t *handle, pcap_handler callback, u_char *userdata)
 
 	    pcap_header.ts.tv_sec = 0;
 
-	    ret = pfring_recv(handle->ring, (u_char**)&packet,
-			      0, &pcap_header,
-			      wait_for_incoming_packet);
+	    //if(pfring_poll(handle->ring, handle->md.timeout) > 0)
+	      ret = pfring_recv(handle->ring, (u_char**)&packet,
+				0, &pcap_header,
+				wait_for_incoming_packet);
+	    //else
+	    //  return(0);
 
 	    if(ret == 0) {
 	      if (errno == EINTR)
@@ -1866,7 +1874,7 @@ pcap_stats_linux(pcap_t *handle, struct pcap_stat *stats)
 	    if (handle->ring->dna.dna_mapped_device)
 	      handle->md.stat.ps_ifdrop = ring_stats.drop;
 	    else
-	    handle->md.stat.ps_drop = ring_stats.drop;
+	      handle->md.stat.ps_drop = ring_stats.drop;
 	    *stats = handle->md.stat;
 	    return 0;
 	  }
@@ -2430,7 +2438,7 @@ pcap_setfilter_linux_common(pcap_t *handle, struct bpf_program *filter,
 
 #ifdef HAVE_PF_RING
 	if(can_filter_in_kernel
-	   && (!strncmp(handle->md.device, "dna", 3)))
+	   && handle->ring != NULL && handle->ring->dna.dna_mapped_device)
 	  can_filter_in_kernel = 0; /* With DNA we need to filter in userland
 				       as the kernel is bypassed
 				    */
@@ -5170,8 +5178,11 @@ int pcap_set_application_name(pcap_t *handle, char *name) {
 }
 
 int pcap_set_watermark(pcap_t *handle, u_int watermark) {
-  int ret = pfring_set_poll_watermark(handle->ring, watermark);
-  handle->ring->dna.dna_rx_sync_watermark = watermark;
+  int ret = -1;
+  if (handle->ring) {
+    ret = pfring_set_poll_watermark(handle->ring, watermark);
+    handle->ring->dna.dna_rx_sync_watermark = watermark;
+  }
   return(ret);
 }
 #endif

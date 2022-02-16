@@ -46,13 +46,6 @@
 #include <librdi.h>
 #endif
 
-#ifdef ENABLE_QAT_PM
-#include <cpa_types.h>
-#include "cpa_pm.h"
-#include "cpa_pm_compile.h"
-#include "pfring_qat.h"
-#endif
-
 #define MAX_CAPLEN             65535
 #define PAGE_SIZE               4096
 
@@ -127,7 +120,7 @@ extern "C" {
   /* ********************************* */
 
   typedef struct {
-    u_int64_t recv, drop, droppedbyfilter;
+    u_int64_t recv, drop;
   } pfring_stat;
 
   /* ********************************* */
@@ -145,7 +138,8 @@ extern "C" {
   /* ********************************* */
   
   struct __pfring {
-    u_int8_t initialized, enabled, long_header, rss_mode, force_timestamp, strip_hw_timestamp;
+    u_int8_t initialized, enabled, long_header, rss_mode, force_timestamp, strip_hw_timestamp, 
+             disable_parsing, disable_timestamp;
     packet_direction direction; /* Specify the capture direction for packets */
     socket_mode mode;
 
@@ -262,10 +256,11 @@ extern "C" {
     u_int8_t (*dna_check_packet_to_read) (pfring *, u_int8_t);
     u_char*  (*dna_next_packet)      (pfring *, u_char **, u_int, struct pfring_pkthdr *);
 
-    u_int    (*dna_get_num_tx_slots)(pfring* ring);
-    u_int    (*dna_get_num_rx_slots)(pfring* ring);
-    u_int    (*dna_get_next_free_tx_slot)(pfring* ring);
-    int      (*dna_copy_tx_packet_into_slot)(pfring* ring, u_int32_t tx_slot_id, char* buffer, u_int len);
+    u_int    (*dna_get_num_tx_slots)(pfring *ring);
+    u_int    (*dna_get_num_rx_slots)(pfring *ring);
+    u_int    (*dna_get_next_free_tx_slot)(pfring *ring);
+    u_char*  (*dna_copy_tx_packet_into_slot)(pfring *ring, u_int32_t tx_slot_id, char *buffer, u_int len);
+    u_int8_t (*dna_tx_ready)(pfring *);
 
     /* Silicom Redirector Only */
     struct {
@@ -294,6 +289,9 @@ extern "C" {
 
     /* Reflector socket (copy RX packets onto it) */
     pfring *reflector_socket;
+
+    /* Semi-DNA devices (1- copy) */
+    pfring *one_copy_rx_pfring;
   };
 
   /* ********************************* */
@@ -307,6 +305,8 @@ extern "C" {
   #define PF_RING_RX_PACKET_BOUNCE     1 << 6
   #define PF_RING_DNA_FIXED_RSS_Q_0    1 << 7
   #define PF_RING_STRIP_HW_TIMESTAMP   1 << 8
+  #define PF_RING_DO_NOT_PARSE         1 << 9  /* parsing already disabled in zero-copy */
+  #define PF_RING_DO_NOT_TIMESTAMP     1 << 10 /* sw timestamp already disabled in zero-copy */
 
   /* ********************************* */
 
@@ -395,6 +395,7 @@ extern "C" {
   int pfring_adjust_device_clock(pfring *ring, struct timespec *offset, int8_t sign);
   void pfring_sync_indexes_with_kernel(pfring *ring);
   int pfring_send_last_rx_packet(pfring *ring, int tx_interface_id);
+  int pfring_get_link_status(pfring *ring);
 
   u_int pfring_get_num_tx_slots(pfring* ring);
   u_int pfring_get_num_rx_slots(pfring* ring);
@@ -430,6 +431,8 @@ extern "C" {
   char* pfring_format_numbers(double val, char *buf, u_int buf_len, u_int8_t add_decimals);
   int pfring_enable_hw_timestamp(pfring* ring, char *device_name, u_int8_t enable_rx, u_int8_t enable_tx);
   int pfring_get_mtu_size(pfring* ring);
+  int pfring_print_parsed_pkt(char *buff, u_int buff_len, const u_char *p, const struct pfring_pkthdr *h);
+  int pfring_print_pkt(char *buff, u_int buff_len, const u_char *p, u_int len, u_int caplen);
 
   /* ********************************* */
 

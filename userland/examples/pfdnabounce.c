@@ -213,6 +213,12 @@ int dummyProcessPacketZero(u_int32_t *pkt_len, u_char *pkt, const u_char *user_b
   struct dir_info *di;
   u_int32_t len = *pkt_len;
 
+#ifdef DEBUG
+    int i = 0;
+    for(i=0; i<32; i++) printf("%02X ", pkt[i]);
+    printf("\n");
+#endif
+
   if(unlikely(handle_ts_card)) {
     u_int8_t ts_len = 0;
     switch(pkt[len-1]) {
@@ -237,6 +243,16 @@ int dummyProcessPacketZero(u_int32_t *pkt_len, u_char *pkt, const u_char *user_b
     *nshort2 = *nshort3;
     *nshort3 = htons(newhshort3);
     //printf("to 0x%04X 0x%04X\n", ntohs(*nshort2), ntohs(*nshort3));
+  }
+#endif
+
+#if 0 /* print the packet */
+  {
+    char bigbuf[4096];
+    int buflen = 0;
+    buflen += snprintf(&bigbuf[buflen], sizeof(bigbuf) - buflen, "[Dir %d]", direction);
+    pfring_print_pkt(&bigbuf[buflen], sizeof(bigbuf) - buflen, pkt, len, len);
+    fputs(bigbuf, stdout);
   }
 #endif
 
@@ -292,7 +308,13 @@ void packetConsumerLoopZeroCluster() {
 /* *************************************** */
 
 void dummyProcessPacket(const struct pfring_pkthdr *h, const u_char *p, const u_char *user_bytes) { 
-  
+
+#ifdef DEBUG
+    int i = 0;
+    for(i=0; i<32; i++) printf("%02X ", p[i]);
+    printf("\n");
+#endif
+
   pfring_send(pd2, (char*)p, h->caplen, flush);
 
   dir_stats[0].numPkts++;

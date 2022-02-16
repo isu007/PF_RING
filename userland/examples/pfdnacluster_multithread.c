@@ -217,8 +217,6 @@ void printHelp(void) {
 	 "                3 - Fan-Out\n");
   printf("-x <if index>   Forward all packets to the selected interface (Enable TX)\n");
   printf("-b              Bridge the interfaces listed in -i in pairs (Enable TX)\n");
-  printf("-z <tx device>  Send packets received from the cluster directly to <tx device>\n"
-         "                in zero-copy using a per-thread RSS channel (experimental)\n");
   printf("-a              Active packet wait\n");
   printf("-u <mountpoint> Use hugepages for packet memory allocation\n");
   printf("-p              Print per-interface absolute stats\n");
@@ -316,9 +314,8 @@ void* packet_consumer_thread(void *_id) {
   struct pfring_pkthdr hdr;
   u_char *buffer = NULL;
  
-  if (numCPU > 1) {
 #ifdef HAVE_PTHREAD_SETAFFINITY_NP
-    /* Bind this thread to a specific core */
+  if (numCPU > 1) { /* bind this thread to a specific core */
     cpu_set_t cpuset;
     u_long core_id;
     int s;
@@ -336,8 +333,8 @@ void* packet_consumer_thread(void *_id) {
     else {
       printf("Set thread %lu on core %lu/%u\n", thread_id, core_id, numCPU);
     }
-#endif
   }
+#endif
 
   memset(&hdr, 0, sizeof(hdr));
 
@@ -409,7 +406,7 @@ int main(int argc, char* argv[]) {
   numCPU = sysconf( _SC_NPROCESSORS_ONLN );
   startTime.tv_sec = 0;
 
-  while ((c = getopt(argc,argv,"ahi:bc:n:m:r:t:g:x:pu:z:")) != -1) {
+  while ((c = getopt(argc,argv,"ahi:bc:n:m:r:t:g:x:pu:")) != -1) {
     switch (c) {
     case 'a':
       wait_for_packet = 0;
@@ -575,6 +572,7 @@ int main(int argc, char* argv[]) {
   /* Setting up important details... */
   dna_cluster_set_wait_mode(dna_cluster_handle, !wait_for_packet /* active_wait */);
   dna_cluster_set_cpu_affinity(dna_cluster_handle, rx_bind_core, tx_bind_core);
+  dna_cluster_set_thread_name(dna_cluster_handle, "rx-thread", "tx-thread");
 
   /* The default distribution function allows to balance per IP 
     in a coherent mode (not like RSS that does not do that) */

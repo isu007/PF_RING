@@ -18,10 +18,6 @@
 #include "pfring.h"
 #include <net/ethernet.h>
 
-#ifdef ENABLE_QAT_PM
-#include "pfring_qat.c"
-#endif
-
 // #define RING_DEBUG
 
 #define EXTRA_SAFE 1
@@ -109,12 +105,14 @@ pfring* pfring_open(const char *device_name, u_int32_t caplen, u_int32_t flags) 
   ring->direction           = rx_and_tx_direction;
   ring->mode                = send_and_recv_mode;
   ring->long_header         = (flags & PF_RING_LONG_HEADER) ? 1 : 0;
-  ring->rss_mode            = (flags & PF_RING_DNA_SYMMETRIC_RSS) ? PF_RING_DNA_SYMMETRIC_RSS : 0;
-  ring->rss_mode            = (flags & PF_RING_DNA_FIXED_RSS_Q_0) ? PF_RING_DNA_FIXED_RSS_Q_0 : 0;
+  ring->rss_mode            = (flags & PF_RING_DNA_SYMMETRIC_RSS) ? PF_RING_DNA_SYMMETRIC_RSS : (
+                              (flags & PF_RING_DNA_FIXED_RSS_Q_0) ? PF_RING_DNA_FIXED_RSS_Q_0 : 0);
   ring->force_timestamp     = (flags & PF_RING_TIMESTAMP) ? 1 : 0;
   ring->strip_hw_timestamp  = (flags & PF_RING_STRIP_HW_TIMESTAMP) ? 1 : 0;
   ring->hw_ts.enable_hw_timestamp = (flags & PF_RING_HW_TIMESTAMP) ? 1 : 0;
   ring->tx.enabled_rx_packet_send = (flags & PF_RING_RX_PACKET_BOUNCE) ? 1 : 0;
+  ring->disable_parsing     = (flags & PF_RING_DO_NOT_PARSE) ? 1 : 0;
+  ring->disable_timestamp   = (flags & PF_RING_DO_NOT_TIMESTAMP) ? 1 : 0;
 
 #ifdef RING_DEBUG
   printf("pfring_open: device_name=%s\n", device_name);
@@ -193,14 +191,6 @@ pfring* pfring_open(const char *device_name, u_int32_t caplen, u_int32_t flags) 
   ring->mtu_len = pfring_get_mtu_size(ring);
   if(ring->mtu_len == 0) ring->mtu_len =  9000 /* Jumbo MTU */;
   ring->mtu_len += sizeof(struct ether_header);
-
-#ifdef ENABLE_QAT_PM
-  ring->qat = (QAThandle*)malloc(sizeof(QAThandle));
-  if(ring->qat == NULL) {
-    printf("[PF_RING] Not enough mempory for QAT\n");
-  } else
-    initQAThandle((QAThandle*)ring->qat);
-#endif
 
   ring->initialized = 1;
 
@@ -284,6 +274,9 @@ void pfring_close(pfring *ring) {
   if(!ring)
     return;
 
+  if(ring->one_copy_rx_pfring)
+    pfring_close(ring->one_copy_rx_pfring);
+
   pfring_shutdown(ring);
 
   if(ring->close)
@@ -293,11 +286,6 @@ void pfring_close(pfring *ring) {
     pthread_rwlock_destroy(&ring->rx_lock);
     pthread_rwlock_destroy(&ring->tx_lock);
   }
-
-#ifdef ENABLE_QAT_PM
-  if(ring->qat)
-    freeHandle((QAThandle*)ring->qat);
-#endif
 
   free(ring->device_name);
   free(ring);
@@ -370,24 +358,11 @@ int pfring_loop(pfring *ring, pfringProcesssPacket looper,
   while(!ring->break_recv_loop) {
     rc = ring->recv(ring, &buffer, 0, &hdr, wait_for_packet);
 
-#ifdef ENABLE_QAT_PM
-    if((rc > 0) && (ring->qat != NULL)) {
-      QAThandle *qat = (QAThandle*)ring->qat;
-
-      if(qat->patternId > 1) {
-      /* We have something to search */
-      
-	if(checkMatch(qat, (char*)buffer, hdr.caplen) == 0)
-	  rc = 0;
-	else
-	  qat->num_filtered++;
-      }
-    }
-#endif
-
     if(rc < 0)
       break;
     else if(rc > 0) {
+      hdr.caplen = min_val(hdr.caplen, ring->caplen);
+
       looper(&hdr, buffer, user_bytes);
     } else {
       /* if(!wait_for_packet) usleep(1); */
@@ -404,6 +379,9 @@ void pfring_breakloop(pfring *ring) {
     return;
 
   ring->break_recv_loop = 1;
+
+  if(ring->one_copy_rx_pfring != NULL)
+    ring->one_copy_rx_pfring->break_recv_loop = 1;
 }
 
 /* **************************************************** */
@@ -544,13 +522,12 @@ void pfring_bundle_close(pfring_bundle *bundle) {
 
 int pfring_stats(pfring *ring, pfring_stat *stats) {
   if(ring && ring->stats) {
-    int rc = ring->stats(ring, stats);
-
-#ifdef ENABLE_QAT_PM
-    stats->droppedbyfilter += ((QAThandle*)ring->qat)->num_filtered;
-#endif
-
-    return(rc);
+    if(ring->enabled)
+      return(ring->stats(ring, stats));
+    else {
+      memset(stats, 0, sizeof(pfring_stat));
+      return(0);
+    }
   }
 
   return(PF_RING_ERROR_NOT_SUPPORTED);
@@ -573,25 +550,18 @@ int pfring_recv(pfring *ring, u_char** buffer, u_int buffer_len,
 
     ring->break_recv_loop = 0;
     rc = ring->recv(ring, buffer, buffer_len, hdr, wait_for_incoming_packet);
+    hdr->caplen = min_val(hdr->caplen, ring->caplen);
 
-#ifdef ENABLE_QAT_PM
-    if((rc > 0) && (ring->qat != NULL)) {
-      QAThandle *qat = (QAThandle*)ring->qat;
-
-      if(qat->patternId > 1) {
-      /* We have something to search */
-	
-	if(checkMatch(qat, (char*)*buffer, hdr->caplen) == 0)
-	  return(0);
-      }
+    if(unlikely(ring->reflector_socket != NULL)) {
+      if (rc > 0)
+        pfring_send(ring->reflector_socket, (char *) *buffer, hdr->caplen, 0 /* flush */);
     }
-#endif
-
-    if(unlikely(ring->reflector_socket != NULL))
-      pfring_send(ring->reflector_socket, (char *) *buffer, hdr->caplen, 0 /* flush */);
 
     return rc;
   }
+
+  if(!ring->enabled)
+    return(PF_RING_ERROR_RING_NOT_ENABLED);
 
   return(PF_RING_ERROR_NOT_SUPPORTED);
 }
@@ -711,7 +681,7 @@ int pfring_bind(pfring *ring, char *device_name) {
 /* **************************************************** */
 
 int pfring_send(pfring *ring, char *pkt, u_int pkt_len, u_int8_t flush_packet) {
-  int rc = -1;
+  int rc;
 
   if(unlikely(pkt_len > ring->mtu_len))
     return(PF_RING_ERROR_INVALID_ARGUMENT); /* Packet too long */
@@ -729,15 +699,20 @@ int pfring_send(pfring *ring, char *pkt, u_int pkt_len, u_int8_t flush_packet) {
 
     if(unlikely(ring->reentrant))
       pthread_rwlock_unlock(&ring->tx_lock);
+
+    return rc;
   }
 
-  return rc;
+  if(!ring->enabled)
+    return(PF_RING_ERROR_RING_NOT_ENABLED);
+
+  return(PF_RING_ERROR_NOT_SUPPORTED);
 }
 
 /* **************************************************** */
 
 int pfring_send_ifindex(pfring *ring, char *pkt, u_int pkt_len, u_int8_t flush_packet, int if_index) {
-  int rc = -1;
+  int rc;
 
   if(unlikely(pkt_len > ring->mtu_len))
     return(PF_RING_ERROR_INVALID_ARGUMENT); /* Packet too long */
@@ -755,15 +730,20 @@ int pfring_send_ifindex(pfring *ring, char *pkt, u_int pkt_len, u_int8_t flush_p
 
     if(unlikely(ring->reentrant))
       pthread_rwlock_unlock(&ring->tx_lock);
+
+    return rc;
   }
 
-  return rc;
+  if(!ring->enabled)
+    return(PF_RING_ERROR_RING_NOT_ENABLED);
+
+  return(PF_RING_ERROR_NOT_SUPPORTED);
 }
 
 /* **************************************************** */
 
 int pfring_send_parsed(pfring *ring, char *pkt, struct pfring_pkthdr *hdr, u_int8_t flush_packet) {
-  int rc = -1;
+  int rc;
 
   if(likely(ring
 	    && ring->enabled
@@ -782,16 +762,16 @@ int pfring_send_parsed(pfring *ring, char *pkt, struct pfring_pkthdr *hdr, u_int
     return rc;
   }
 
-  if(ring && !ring->send_parsed)
-    rc = PF_RING_ERROR_NOT_SUPPORTED;
+  if(!ring->enabled)
+    return(PF_RING_ERROR_RING_NOT_ENABLED);
 
-  return rc;
+  return(PF_RING_ERROR_NOT_SUPPORTED);
 }
 
 /* **************************************************** */
 
 int pfring_send_get_time(pfring *ring, char *pkt, u_int pkt_len, struct timespec *ts) {
-  int rc = -1;
+  int rc;
 
   if(likely(ring
 	    && ring->enabled
@@ -810,10 +790,10 @@ int pfring_send_get_time(pfring *ring, char *pkt, u_int pkt_len, struct timespec
     return rc;
   }
 
-  if(ring && !ring->send_get_time)
-    rc = PF_RING_ERROR_NOT_SUPPORTED;
+  if(!ring->enabled)
+    return(PF_RING_ERROR_RING_NOT_ENABLED);
 
-  return rc;
+  return(PF_RING_ERROR_NOT_SUPPORTED);
 }
 
 /* **************************************************** */
@@ -848,7 +828,7 @@ int pfring_get_selectable_fd(pfring *ring) {
   if(ring && ring->get_selectable_fd)
     return ring->get_selectable_fd(ring);
 
-  return(PF_RING_ERROR_NOT_SUPPORTED);
+  return(-1);
 }
 
 /* **************************************************** */
@@ -1096,6 +1076,12 @@ int pfring_get_device_ifindex(pfring *ring, char *device_name, int *if_index) {
 
 /* **************************************************** */
 
+int pfring_get_link_status(pfring *ring) {
+  return(pfring_mod_get_link_status(ring));
+}
+
+/* **************************************************** */
+
 u_int16_t pfring_get_slot_header_len(pfring *ring) {
   if(ring && ring->get_slot_header_len)
     return ring->get_slot_header_len(ring);
@@ -1293,7 +1279,7 @@ u_int pfring_get_num_rx_slots(pfring* ring) {
 int pfring_copy_tx_packet_into_slot(pfring* ring,
 				    u_int16_t tx_slot_id, char* buffer, u_int len) {
   if(ring && ring->dna_copy_tx_packet_into_slot)
-    return ring->dna_copy_tx_packet_into_slot(ring, tx_slot_id, buffer, len);
+    return (ring->dna_copy_tx_packet_into_slot(ring, tx_slot_id, buffer, len) != NULL ? 0 : -1);
 
   return(PF_RING_ERROR_NOT_SUPPORTED);
 }
@@ -1398,13 +1384,6 @@ int pfring_search_payload(pfring *ring, char *string_to_search) {
   if (!ring)
     return(-1);
     
-#ifdef ENABLE_QAT_PM  
-  if (!ring->qat)
-    return(-1);
-
-  return(addStringToSearch((QAThandle*)ring->qat, string_to_search));
-#else
   return(-2);
-#endif
 }
 

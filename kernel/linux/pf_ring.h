@@ -25,7 +25,7 @@
 #define DEFAULT_BUCKET_LEN            128
 #define MAX_NUM_DEVICES               256
 
-// #define MAX_NUM_RING_SOCKETS          64 /* see MAX_NUM_LIST_ELEMENTS */
+#define MAX_NUM_RING_SOCKETS           64
 
 /* Watermark */
 #define DEFAULT_MIN_PKT_QUEUED        128
@@ -34,8 +34,8 @@
 #define pfring_ptr ax25_ptr
 
 /* Versioning */
-#define RING_VERSION                "5.5.3"
-#define RING_VERSION_NUM           0x050503
+#define RING_VERSION                "5.6.2"
+#define RING_VERSION_NUM           0x050602
 
 /* Set */
 #define SO_ADD_TO_CLUSTER                 99
@@ -77,6 +77,7 @@
 #define SO_CREATE_CLUSTER_REFEREE        135
 #define SO_PUBLISH_CLUSTER_OBJECT        136
 #define SO_LOCK_CLUSTER_OBJECT           137
+#define SO_UNLOCK_CLUSTER_OBJECT         138
 
 /* Get */
 #define SO_GET_RING_VERSION              170
@@ -96,6 +97,7 @@
 #define SO_GET_BOUND_DEVICE_IFINDEX      184
 #define SO_GET_DEVICE_IFINDEX            185
 #define SO_GET_APPL_STATS_FILE_NAME      186
+#define SO_GET_LINK_STATUS               187
 
 /* Map */
 #define SO_MAP_DNA_DEVICE                190
@@ -112,6 +114,7 @@
 #define PF_RING_ERROR_UNKNOWN_ADAPTER      -9
 #define PF_RING_ERROR_NOT_ENOUGH_MEMORY   -10
 #define PF_RING_ERROR_INVALID_STATUS      -11
+#define PF_RING_ERROR_RING_NOT_ENABLED    -12
 
 #define REFLECTOR_NAME_LEN                 8
 
@@ -309,7 +312,7 @@ struct pfring_pkthdr {
 
 /* ************************************************* */
 
-#define MAX_NUM_LIST_ELEMENTS  64 /* sizeof(bits_set) [see below] */
+#define MAX_NUM_LIST_ELEMENTS MAX_NUM_RING_SOCKETS /* sizeof(bits_set) [see below] */
 
 #ifdef __KERNEL__
 
@@ -847,7 +850,6 @@ struct public_cluster_object_info {
   u_int32_t cluster_id;
   u_int32_t object_type;
   u_int32_t object_id;
-  u_int32_t references;
 };
 
 struct lock_cluster_object_info {
@@ -855,6 +857,7 @@ struct lock_cluster_object_info {
   u_int32_t object_type;
   u_int32_t object_id;
   u_int32_t lock_mask;
+  u_int32_t reserved;
 };
 
 /* ************************************************* */
@@ -895,19 +898,20 @@ typedef struct {
   struct list_head list;
 } ring_cluster_element;
 
-#define MAX_NUM_DNA_BOUND_SOCKETS  8
+#define MAX_NUM_DNA_BOUND_SOCKETS MAX_NUM_RING_SOCKETS
 
 typedef struct {
   u8 num_bound_sockets;
   dna_device dev;
   struct list_head list;
   /*
-    In the DNA world only one application can open the device@channel
-    per direction. The two variables below are used to keep
-    pointers to the max two sockets (one for RX and one for TX) that can open
-    the DNA socket
+    In the DNA world only one application can open and enable the 
+    device@channel per direction. The array below is used to keep
+    pointers to the sockets bound to device@channel in order to
+    enable no more than one socket for RX and one for TX.
   */
   struct pf_ring_socket *bound_sockets[MAX_NUM_DNA_BOUND_SOCKETS];
+  rwlock_t lock;
 } dna_device_list;
 
 #define MAX_NUM_IFIDX                       1024
@@ -1029,7 +1033,6 @@ struct dna_cluster {
 typedef struct {
   u_int32_t object_type;
   u_int32_t object_id;
-  u_int32_t references;
   u_int32_t lock_bitmap;
 
   struct list_head list;
@@ -1064,10 +1067,12 @@ typedef u_int32_t (*do_rehash_rss)(struct sk_buff *skb, struct pfring_pkthdr *hd
 
 /* ************************************************* */
 
-#define NUM_FRAGMENTS_HASH_SLOTS 4096
+#define NUM_FRAGMENTS_HASH_SLOTS                          4096
+#define MAX_CLUSTER_FRAGMENTS_LEN   8*NUM_FRAGMENTS_HASH_SLOTS
 
 struct hash_fragment_node {
   /* Key */
+  u_int32_t ipv4_src_host, ipv4_dst_host;
   u_int16_t ip_fragment_id;
 
   /* Value */
@@ -1195,7 +1200,6 @@ struct pf_ring_socket {
 
   /* Generic cluster */
   struct cluster_referee *cluster_referee;
-  struct list_head locked_objects_list;
   cluster_client_type cluster_role;
 };
 

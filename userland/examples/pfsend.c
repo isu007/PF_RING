@@ -31,7 +31,6 @@
 #include <unistd.h>
 #include <sys/mman.h>
 #include <errno.h>
-#include <sys/poll.h>
 #include <netinet/in_systm.h>
 #include <netinet/in.h>
 #include <netinet/ip.h>
@@ -93,6 +92,7 @@ int reforge_mac = 0;
 char mac_address[6];
 int send_len = 60;
 int if_index = -1;
+int daemon_mode = 0;
 
 #define DEFAULT_DEVICE     "eth0"
 
@@ -152,15 +152,17 @@ void print_stats() {
   avgThptBytes = (double)(num_bytes_good_sent * 1000)/deltaMillisec;
   avgThptBits = avgThptBytes * 8;
 
-  snprintf(statsBuf, sizeof(statsBuf),
-	   "TX rate: [current %s pps/%s Gbps][average %s pps/%s Gbps][total %s pkts]",
-	   pfring_format_numbers(currentThpt, buf1, sizeof(buf1), 1),
-	   pfring_format_numbers(currentThptBits/(1000*1000*1000), buf2, sizeof(buf2), 1),
-	   pfring_format_numbers(avgThpt, buf3, sizeof(buf3), 1),
-	   pfring_format_numbers(avgThptBits/(1000*1000*1000),  buf4, sizeof(buf4), 1),
-	   pfring_format_numbers(num_pkt_good_sent, buf5, sizeof(buf5), 1));
-  
-  fprintf(stdout, "%s\n", statsBuf);
+  if (!daemon_mode) {
+    snprintf(statsBuf, sizeof(statsBuf),
+	     "TX rate: [current %s pps/%s Gbps][average %s pps/%s Gbps][total %s pkts]",
+	     pfring_format_numbers(currentThpt, buf1, sizeof(buf1), 1),
+	     pfring_format_numbers(currentThptBits/(1000*1000*1000), buf2, sizeof(buf2), 1),
+	     pfring_format_numbers(avgThpt, buf3, sizeof(buf3), 1),
+	     pfring_format_numbers(avgThptBits/(1000*1000*1000),  buf4, sizeof(buf4), 1),
+	     pfring_format_numbers(num_pkt_good_sent, buf5, sizeof(buf5), 1));
+ 
+    fprintf(stdout, "%s\n", statsBuf);
+  }
 
   deltaMillisecStart = delta_time(&now, &startTime);
   snprintf(statsBuf, sizeof(statsBuf),
@@ -227,6 +229,8 @@ void printHelp(void) {
   printf("-w <watermark>  TX watermark (low value=low latency) [not effective on DNA]\n");
   printf("-z              Disable zero-copy, if supported [DNA only]\n");
   printf("-x <if index>   Send to the selected interface, if supported\n");
+  printf("-d              Daemon mode\n");
+  printf("-P <pid file>   Write pid to the specified file (daemon mode only)\n");
   printf("-v              Verbose\n");
   exit(0);
 }
@@ -343,8 +347,9 @@ int main(int argc, char* argv[]) {
   int num_balanced_pkts = 1, watermark = 0;
   u_int num_pcap_pkts = 0;
   int send_full_pcap_once = 1;
+  char *pidFileName = NULL;
 
-  while((c = getopt(argc, argv, "b:hi:n:g:l:af:r:vm:w:zx:")) != -1) {
+  while((c = getopt(argc, argv, "b:dhi:n:g:l:af:r:vm:P:w:zx:")) != -1) {
     switch(c) {
     case 'b':
       num_balanced_pkts = atoi(optarg);
@@ -392,13 +397,17 @@ int main(int argc, char* argv[]) {
       break;
     case 'w':
       watermark = atoi(optarg);
-
       if(watermark < 1) watermark = 1;
       break;
     case 'z':
       disable_zero_copy = 1;
       break;
-
+    case 'd':
+      daemon_mode = 1;
+      break;
+    case 'P':
+      pidFileName = strdup(optarg);
+      break;
     default:
       printHelp();
     }
@@ -407,6 +416,9 @@ int main(int argc, char* argv[]) {
   if((in_dev == NULL) || (num_balanced_pkts < 1)
      || (optind < argc) /* Extra argument */)
     printHelp();
+
+  if (daemon_mode)
+    daemonize(pidFileName);
 
   printf("Sending packets on %s\n", in_dev);
 
@@ -462,7 +474,7 @@ int main(int argc, char* argv[]) {
     struct pcap_pkthdr *h;
     pcap_t *pt = pcap_open_offline(pcap_in, ebuf);
     struct timeval beginning = { 0, 0 };
-    int avg_send_len = 0;
+    u_int64_t avg_send_len = 0;
 
     if(pt) {
       struct packet *last = NULL;
@@ -670,14 +682,7 @@ int main(int argc, char* argv[]) {
     } else if(rc < 0) {
       /* Not enough space in buffer */
       if(!active_poll) {
-#if 1
 	usleep(1);
-#else
-        if(bind_core >= 0)
-	  usleep(1);
-	else
-	  pfring_poll(pd, 0); //sched_yield();
-#endif
       }
       goto redo;
     }

@@ -212,49 +212,38 @@ dna_device_model dna_model(struct ixgbe_hw *hw){
 /* ********************************** */
 
 void notify_function_ptr(void *rx_data, void *tx_data, u_int8_t device_in_use) {
-  struct ixgbe_ring	*rx_ring = (struct ixgbe_ring*)rx_data;
-  struct ixgbe_adapter	*adapter = netdev_priv(rx_ring->netdev);
-  //struct ixgbe_ring     *tx_ring = adapter->tx_ring[rx_ring->queue_index];
+  struct ixgbe_ring    *rx_ring = (struct ixgbe_ring *) rx_data;
+  struct ixgbe_ring    *tx_ring = (struct ixgbe_ring *) tx_data;
+  struct ixgbe_ring    *xx_ring = (rx_ring != NULL) ? rx_ring : tx_ring;
+  struct ixgbe_adapter *adapter = netdev_priv(xx_ring->netdev);
 
-  if(unlikely(enable_debug))
-    printk("%s(): device_in_use = %d\n",__FUNCTION__, device_in_use);
+  if(likely(device_in_use)) { /* We start using this device */
 
-  /* I need interrupts for purging buckets when queues are not in use */
-  ixgbe_irq_enable_queues(adapter, ((u64)1 << rx_ring->q_vector->v_idx));
-
-  if(likely(device_in_use)) {
-    /* We start using this device */
     try_module_get(THIS_MODULE); /* ++ */
-    rx_ring->dna.queue_in_use = 1;
 
-    if(unlikely(enable_debug))
-      printk("[DNA] %s(): %s@%d is IN use\n", __FUNCTION__,
-	     rx_ring->netdev->name, rx_ring->queue_index);
+    if (rx_ring != NULL) {
+      if(adapter->hw.mac.type != ixgbe_mac_82598EB)
+        ixgbe_irq_disable_queues(adapter, ((u64)1 << rx_ring->q_vector->v_idx));
+    }
 
-    if(adapter->hw.mac.type != ixgbe_mac_82598EB)
-      ixgbe_irq_disable_queues(adapter, ((u64)1 << rx_ring->q_vector->v_idx));
-  } else {
-    /* We're done using this device */
+  } else { /* We're done using this device */
 
-    /* resetting the ring */
-    /* we *must* reset the right direction only (doing this in userspace)
-    dna_cleanup_rx_ring(rx_ring);
-    dna_cleanup_tx_ring(tx_ring);
-    */
+    if (rx_ring != NULL) {
+      if(adapter->hw.mac.type != ixgbe_mac_82598EB)
+        /* TODO Check this*/
+        //ixgbe_irq_enable_queues(adapter, ((u64)1 << rx_ring->q_vector->v_idx));
+        ixgbe_irq_disable_queues(adapter, ((u64)1 << rx_ring->q_vector->v_idx));
+    }
 
     module_put(THIS_MODULE);  /* -- */
-
-    rx_ring->dna.queue_in_use = 0;
-
-    if(adapter->hw.mac.type != ixgbe_mac_82598EB)
-      /* TODO Check this*/
-      //ixgbe_irq_enable_queues(adapter, ((u64)1 << rx_ring->q_vector->v_idx));
-      ixgbe_irq_disable_queues(adapter, ((u64)1 << rx_ring->q_vector->v_idx));
-
-    if(unlikely(enable_debug))
-      printk("[DNA] %s(): %s@%d is NOT IN use\n", __FUNCTION__,
-	     rx_ring->netdev->name, rx_ring->queue_index);
   }
+
+  if (rx_ring != NULL) rx_ring->dna.queue_in_use = device_in_use;
+  if (tx_ring != NULL) tx_ring->dna.queue_in_use = device_in_use;
+
+  if(unlikely(enable_debug))
+    printk("[DNA] %s(): %s@%d is %sIN use\n", __FUNCTION__,
+	   xx_ring->netdev->name, xx_ring->queue_index, device_in_use ? "" : "NOT ");
 }
 
 /* ********************************** */
@@ -274,15 +263,14 @@ int wait_packet_function_ptr(void *data, int mode)
   if(!rx_ring->dna.memory_allocated) return(0);
 
   if(mode == 1 /* Enable interrupt */) {
-    union ixgbe_adv_rx_desc *rx_desc;
+    union ixgbe_adv_rx_desc *rx_desc, *next_rx_desc;
     u32	staterr;
     u8	reg_idx = rx_ring->reg_idx;
     u16	i = IXGBE_READ_REG(hw, IXGBE_RDT(reg_idx));
 
     /* Very important: update the value from the register set from userland
      * Here i is the last I've read (zero-copy implementation) */
-    if(++i == rx_ring->count)
-      i = 0;
+    if(++i == rx_ring->count) i = 0;
     /* Here i is the next I have to read */
 
     rx_ring->next_to_clean = i;
@@ -290,6 +278,14 @@ int wait_packet_function_ptr(void *data, int mode)
     rx_desc = IXGBE_RX_DESC(rx_ring, i);
     prefetch(rx_desc);
     staterr = le32_to_cpu(rx_desc->wb.upper.status_error);
+
+    /* trick for appplications calling poll/select directly (indexes not in sync of one position at most) */
+    if (!(staterr & IXGBE_RXD_STAT_DD)) {
+      u16 next_i = i;
+      if(++next_i == rx_ring->count) next_i = 0;
+      next_rx_desc = IXGBE_RX_DESC(rx_ring, next_i);
+      staterr = le32_to_cpu(next_rx_desc->wb.upper.status_error);
+    }
 
     if(unlikely(enable_debug)) {
       printk("%s(): Check if a packet is arrived [idx=%d][staterr=%d][len=%d]\n",
@@ -301,22 +297,28 @@ int wait_packet_function_ptr(void *data, int mode)
     if(!(staterr & IXGBE_RXD_STAT_DD)) {
       rx_ring->dna.rx_tx.rx.interrupt_received = 0;
 
+      if(unlikely(enable_debug))
+        printk("%s(): Packet not arrived yet [slot=%d][queue=%d]\n",
+		__FUNCTION__, i, q_vector->v_idx);
+
       if(!rx_ring->dna.rx_tx.rx.interrupt_enabled) {
 	if(adapter->hw.mac.type != ixgbe_mac_82598EB)
 	  ixgbe_irq_enable_queues(adapter, ((u64)1 << q_vector->v_idx));
 
-	if(unlikely(enable_debug)) printk("%s(): Enabled interrupts, queue = %d\n", __FUNCTION__, q_vector->v_idx);
 	rx_ring->dna.rx_tx.rx.interrupt_enabled = 1;
 
 	if(unlikely(enable_debug))
-	  printk("%s(): Packet not arrived yet: enabling "
-		 "interrupts, queue=%d, i=%d\n",
-		 __FUNCTION__,q_vector->v_idx, i);
+	  printk("%s(): enabling interrupts [queue=%d]\n",
+		 __FUNCTION__, q_vector->v_idx);
       }
 
       /* Refresh the value */
-      staterr = le32_to_cpu(rx_desc->wb.upper.status_error);
+      staterr  = le32_to_cpu(rx_desc->wb.upper.status_error);
+      if (!(staterr & IXGBE_RXD_STAT_DD)) staterr = le32_to_cpu(next_rx_desc->wb.upper.status_error);
     } else {
+      if(unlikely(enable_debug))
+        printk("%s(): New packet arrived\n", __FUNCTION__);
+
       rx_ring->dna.rx_tx.rx.interrupt_received = 1;
     }
 
